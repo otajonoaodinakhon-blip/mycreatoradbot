@@ -15,7 +15,7 @@ GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")      # Ixtiyoriy, lekin rate limit
 PORT = int(os.environ.get("PORT", 5000))
 
 # GitHub Search parametrlari
-SEARCH_QUERY = "stars:>1000"          # 1000+ yulduzli repolar
+SEARCH_QUERY = "stars:>10"          # 1000+ yulduzli repolar
 SORT = "stars"
 ORDER = "desc"
 PER_PAGE = 10                          # Har safar 10 ta repo tekshiriladi
