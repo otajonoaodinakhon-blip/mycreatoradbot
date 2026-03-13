@@ -1,0 +1,5 @@
+Flask
+requests
+python-telegram-bot==13.15
+apscheduler
+psycopg2-binary
