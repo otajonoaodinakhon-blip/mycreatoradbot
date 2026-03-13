@@ -4,31 +4,31 @@ from flask import Flask, request
 from telegram import Bot
 from apscheduler.schedulers.background import BackgroundScheduler
 import psycopg2
+import pytz
 
-# ------------------------
-# ENV variables
-# ------------------------
+# =============================
+# ENV VARIABLES
+# =============================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL = os.environ.get("CHANNEL")          # @kanalingiz
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))  # numeric channel id, xavfsizlik uchun
+CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))  # numeric Telegram channel ID
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_KEY")
-RENDER_URL = os.environ.get("RENDER_URL")    # https://yourapp.onrender.com
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")  # optional
-DATABASE_URL = os.environ.get("DATABASE_URL")  # PostgreSQL
+RENDER_URL = os.environ.get("RENDER_URL")       # webhook uchun, optional
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")   # optional
+DATABASE_URL = os.environ.get("DATABASE_URL")   # PostgreSQL / Neon DB URL
 
-# ------------------------
+# =============================
 # Telegram bot
-# ------------------------
+# =============================
 bot = Bot(token=BOT_TOKEN)
 
-# ------------------------
+# =============================
 # Flask app
-# ------------------------
+# =============================
 app = Flask(__name__)
 
-# ------------------------
-# PostgreSQL connection
-# ------------------------
+# =============================
+# PostgreSQL / Neon DB connection
+# =============================
 conn = psycopg2.connect(DATABASE_URL)
 cursor = conn.cursor()
 
@@ -40,9 +40,9 @@ CREATE TABLE IF NOT EXISTS repos(
 """)
 conn.commit()
 
-# ------------------------
+# =============================
 # DeepSeek AI caption
-# ------------------------
+# =============================
 def generate_caption(name, stars):
     prompt = f"""
 Uzbek tilida qisqa Telegram caption yozing.
@@ -64,9 +64,9 @@ Yulduzlar: {stars}
     except:
         return f"🔥 Yangi GitHub loyiha\n📦 {name}\n⭐ {stars} yulduz"
 
-# ------------------------
+# =============================
 # GitHub repo topish
-# ------------------------
+# =============================
 def get_repo():
     url = "https://api.github.com/search/repositories?q=stars:>0&sort=stars&order=desc&per_page=50"
     headers = {}
@@ -86,9 +86,9 @@ def get_repo():
         return name, stars, owner, repo_url
     return None
 
-# ------------------------
+# =============================
 # ZIP yuklash va Telegramga yuborish
-# ------------------------
+# =============================
 def send_repo():
     repo = get_repo()
     if not repo:
@@ -108,7 +108,6 @@ def send_repo():
 
     caption = generate_caption(name, stars)
 
-    # Faqat CHANNEL_ID ga yuborish
     bot.send_document(
         chat_id=CHANNEL_ID,
         document=open("repo.zip", "rb"),
@@ -121,27 +120,28 @@ def send_repo():
     os.remove("repo.zip")
     print(f"{name} yuborildi!")
 
-# ------------------------
+# =============================
 # Scheduler (har 10 daqiqa)
-# ------------------------
-scheduler = BackgroundScheduler()
+# =============================
+scheduler = BackgroundScheduler(timezone=pytz.UTC)
 scheduler.add_job(send_repo, "interval", minutes=10)
 scheduler.start()
 
-# ------------------------
+# =============================
 # Webhookni avtomatik o‘rnatish
-# ------------------------
+# =============================
 def set_webhook():
-    webhook_url = f"{RENDER_URL}/{BOT_TOKEN}"
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-    r = requests.get(url, params={"url": webhook_url})
-    print("Webhook set:", r.json())
+    if RENDER_URL:
+        webhook_url = f"{RENDER_URL}/{BOT_TOKEN}"
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
+        r = requests.get(url, params={"url": webhook_url})
+        print("Webhook set:", r.json())
 
-set_webhook()  # Deploy paytida
+set_webhook()
 
-# ------------------------
+# =============================
 # Flask routes
-# ------------------------
+# =============================
 @app.route("/", methods=["GET"])
 def home():
     return "Bot ishlayapti"
@@ -150,16 +150,12 @@ def home():
 def webhook():
     data = request.get_json()
     chat_id = data.get("message", {}).get("chat", {}).get("id")
-
-    # Faqat o'z kanal ID dan kelgan xabarlar ishlatiladi
     if chat_id != CHANNEL_ID:
         return "Not allowed"
-
-    # Agar kerak bo'lsa, xabarni ishlash logikasi shu yerda
     return "ok"
 
-# ------------------------
+# =============================
 # Flask run
-# ------------------------
+# =============================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
