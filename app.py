@@ -27,18 +27,22 @@ bot = Bot(token=BOT_TOKEN)
 app = Flask(__name__)
 
 # =============================
-# PostgreSQL / Neon DB connection
+# PostgreSQL table yaratish (bir martalik)
 # =============================
-conn = psycopg2.connect(DATABASE_URL)
-cursor = conn.cursor()
+def init_db():
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS repos(
+        id SERIAL PRIMARY KEY,
+        repo_url TEXT UNIQUE
+    );
+    """)
+    conn.commit()
+    cursor.close()
+    conn.close()
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS repos(
-    id SERIAL PRIMARY KEY,
-    repo_url TEXT UNIQUE
-);
-""")
-conn.commit()
+init_db()
 
 # =============================
 # DeepSeek AI caption
@@ -67,7 +71,7 @@ Yulduzlar: {stars}
 # =============================
 # GitHub repo topish
 # =============================
-def get_repo():
+def get_repo(cursor):
     url = "https://api.github.com/search/repositories?q=stars:>0&sort=stars&order=desc&per_page=50"
     headers = {}
     if GITHUB_TOKEN:
@@ -90,9 +94,15 @@ def get_repo():
 # ZIP yuklash va Telegramga yuborish
 # =============================
 def send_repo():
-    repo = get_repo()
+    # Har jobda yangi connection ochamiz
+    conn = psycopg2.connect(DATABASE_URL)
+    cursor = conn.cursor()
+
+    repo = get_repo(cursor)
     if not repo:
         print("Yangi repo topilmadi")
+        cursor.close()
+        conn.close()
         return
 
     name, stars, owner, repo_url = repo
@@ -101,6 +111,8 @@ def send_repo():
     r = requests.get(zip_url)
     if len(r.content) > 50*1024*1024:
         print(f"{name} fayl kattaligi 50MB dan oshadi, o'tkazildi")
+        cursor.close()
+        conn.close()
         return
 
     with open("repo.zip", "wb") as f:
@@ -114,11 +126,17 @@ def send_repo():
         caption=caption
     )
 
-    cursor.execute("INSERT INTO repos(repo_url) VALUES(%s) ON CONFLICT DO NOTHING", (repo_url,))
+    cursor.execute(
+        "INSERT INTO repos(repo_url) VALUES(%s) ON CONFLICT DO NOTHING",
+        (repo_url,)
+    )
     conn.commit()
 
     os.remove("repo.zip")
     print(f"{name} yuborildi!")
+
+    cursor.close()
+    conn.close()
 
 # =============================
 # Scheduler (har 10 daqiqa)
