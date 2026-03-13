@@ -1,180 +1,230 @@
 import os
+import tempfile
 import requests
-from flask import Flask, request
-from telegram import Bot
-from apscheduler.schedulers.background import BackgroundScheduler
-import psycopg2
-import pytz
+import time
+import logging
+import schedule
+from flask import Flask
+from datetime import datetime
 
-# =============================
-# ENV VARIABLES
-# =============================
+# ------------------- KONFIGURATSIYA -------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHANNEL_ID = int(os.environ.get("CHANNEL_ID"))  # numeric Telegram channel ID
-DEEPSEEK_KEY = os.environ.get("DEEPSEEK_KEY")
-RENDER_URL = os.environ.get("RENDER_URL")       # webhook uchun, optional
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")   # optional
-DATABASE_URL = os.environ.get("DATABASE_URL")   # PostgreSQL / Neon DB URL
+CHANNEL_ID = os.environ.get("CHANNEL_ID")          # Masalan: "@kanalnomi"
+PORT = int(os.environ.get("PORT", 5000))
 
-# =============================
-# Telegram bot
-# =============================
-bot = Bot(token=BOT_TOKEN)
+# GitHub Search parametrlari
+SEARCH_QUERY = "stars:>1000"                       # 1000+ yulduzli repolar
+SORT = "stars"                                     # Yulduzlar soni bo‘yicha saralash
+ORDER = "desc"                                      # Eng ko‘pdan kamga
+PER_PAGE = 10                                       # Har safar 10 ta reponi tekshiramiz
+MAX_SIZE = 50 * 1024 * 1024                         # 50 MB
 
-# =============================
-# Flask app
-# =============================
-app = Flask(__name__)
+# Qaysi branch'larni sinab ko‘rish
+BRANCHES = ["main", "master"]
 
-# =============================
-# PostgreSQL table yaratish (bir martalik)
-# =============================
-def init_db():
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS repos(
-        id SERIAL PRIMARY KEY,
-        repo_url TEXT UNIQUE
-    );
-    """)
-    conn.commit()
-    cursor.close()
-    conn.close()
+# Oldin yuborilgan repolarni eslab qolish uchun (takror yubormaslik)
+SENT_REPOS_FILE = "sent_repos.txt"
 
-init_db()
+# Logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-# =============================
-# DeepSeek AI caption
-# =============================
-def generate_caption(name, stars):
-    prompt = f"""
-Uzbek tilida qisqa Telegram caption yozing.
-Link yozmang.
+# ------------------- YORDAMCHI FUNKSIYALAR -------------------
+def load_sent_repos():
+    """Oldin yuborilgan repolarni fayldan o‘qish"""
+    if not os.path.exists(SENT_REPOS_FILE):
+        return set()
+    with open(SENT_REPOS_FILE, "r") as f:
+        return set(line.strip() for line in f if line.strip())
 
-Loyiha: {name}
-Yulduzlar: {stars}
-"""
-    url = "https://api.deepseek.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_KEY}",
-        "Content-Type": "application/json"
+def save_sent_repo(repo_full_name):
+    """Yangi yuborilgan reponi faylga qo‘shish"""
+    with open(SENT_REPOS_FILE, "a") as f:
+        f.write(repo_full_name + "\n")
+
+# ------------------- GITHUB SEARCH -------------------
+def search_popular_repos():
+    """GitHub Search API orqali eng popular repolarni qidiradi"""
+    url = "https://api.github.com/search/repositories"
+    params = {
+        "q": SEARCH_QUERY,
+        "sort": SORT,
+        "order": ORDER,
+        "per_page": PER_PAGE
     }
-    data = {"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}]}
-
+    headers = {
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
     try:
-        r = requests.post(url, json=data, headers=headers)
-        return r.json()["choices"][0]["message"]["content"]
-    except:
-        return f"🔥 Yangi GitHub loyiha\n📦 {name}\n⭐ {stars} yulduz"
+        resp = requests.get(url, params=params, headers=headers)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("items", [])
+        else:
+            logger.error(f"GitHub search xatosi: {resp.status_code} - {resp.text}")
+            return []
+    except Exception as e:
+        logger.error(f"GitHub search exception: {e}")
+        return []
 
-# =============================
-# GitHub repo topish
-# =============================
-def get_repo(cursor):
-    url = "https://api.github.com/search/repositories?q=stars:>0&sort=stars&order=desc&per_page=50"
-    headers = {}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+# ------------------- ZIP YUKLAB OLISH -------------------
+def download_repo_zip(repo_full_name, default_branch="main"):
+    """Reponi ZIP sifatida yuklab oladi, agar 50MB dan kichik bo‘lsa"""
+    # Avval hajmini tekshiramiz (HEAD so‘rov)
+    head_url = f"https://github.com/{repo_full_name}/archive/refs/heads/{default_branch}.zip"
+    try:
+        head_resp = requests.head(head_url, allow_redirects=True)
+        if head_resp.status_code == 200:
+            content_length = head_resp.headers.get('Content-Length')
+            if content_length and int(content_length) > MAX_SIZE:
+                logger.info(f"{repo_full_name} hajmi {content_length} bayt – 50MB dan katta, tashlab ketildi.")
+                return None
+        else:
+            # Agar branch topilmasa, keyingi branchni sinaymiz
+            return None
+    except Exception as e:
+        logger.debug(f"HEAD so‘rovda xato: {e}")
+        return None
 
-    data = requests.get(url, headers=headers).json()
-    for repo in data.get("items", []):
-        repo_url = repo["html_url"]
-        name = repo["name"]
-        stars = repo["stargazers_count"]
-        owner = repo["owner"]["login"]
-
-        cursor.execute("SELECT * FROM repos WHERE repo_url=%s", (repo_url,))
-        if cursor.fetchone():
+    # Yuklab olish
+    for branch in BRANCHES:
+        zip_url = f"https://github.com/{repo_full_name}/archive/refs/heads/{branch}.zip"
+        try:
+            resp = requests.get(zip_url, stream=True, timeout=30)
+            if resp.status_code == 200:
+                temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+                for chunk in resp.iter_content(chunk_size=8192):
+                    temp_file.write(chunk)
+                temp_file.close()
+                logger.info(f"Yuklab olindi: {repo_full_name} ({branch})")
+                return temp_file.name
+            else:
+                logger.debug(f"Branch {branch} topilmadi (status {resp.status_code})")
+        except Exception as e:
+            logger.error(f"Yuklab olishda xato ({branch}): {e}")
             continue
-        return name, stars, owner, repo_url
+    
+    logger.error(f"Hech qanday branch ishlamadi: {repo_full_name}")
     return None
 
-# =============================
-# ZIP yuklash va Telegramga yuborish
-# =============================
-def send_repo():
-    # Har jobda yangi connection ochamiz
-    conn = psycopg2.connect(DATABASE_URL)
-    cursor = conn.cursor()
+# ------------------- TELEGRAMGA YUBORISH -------------------
+def send_to_telegram(file_path, repo_info):
+    """ZIP faylni Telegram kanaliga description bilan yuboradi"""
+    # Caption yaratish
+    caption = f"📦 **{repo_info['name']}**\n"
+    caption += f"👤 {repo_info['owner']}\n"
+    caption += f"⭐ {repo_info['stars']} stars\n"
+    if repo_info['description']:
+        caption += f"📝 {repo_info['description']}\n"
+    caption += f"🔗 [GitHub](https://github.com/{repo_info['full_name']})\n"
+    caption += f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
-    repo = get_repo(cursor)
-    if not repo:
-        print("Yangi repo topilmadi")
-        cursor.close()
-        conn.close()
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument"
+    try:
+        with open(file_path, "rb") as f:
+            files = {"document": f}
+            data = {
+                "chat_id": CHANNEL_ID,
+                "caption": caption,
+                "parse_mode": "Markdown"
+            }
+            resp = requests.post(url, files=files, data=data)
+        if resp.status_code == 200:
+            logger.info(f"Yuborildi: {repo_info['full_name']}")
+            return True
+        else:
+            logger.error(f"Telegram xatosi: {resp.status_code} - {resp.text}")
+            return False
+    except Exception as e:
+        logger.error(f"Telegramga yuborishda xato: {e}")
+        return False
+
+# ------------------- ASOSIY JOB -------------------
+def process_popular_repos():
+    """Eng popular repolarni qidirib, yangilarini kanalga yuboradi"""
+    logger.info("🔍 Popular repolar qidirilmoqda...")
+    sent_repos = load_sent_repos()
+    repos = search_popular_repos()
+    
+    if not repos:
+        logger.warning("Hech qanday repo topilmadi")
         return
+    
+    new_repos_count = 0
+    for repo in repos:
+        full_name = repo["full_name"]
+        
+        # Oldin yuborilganmi?
+        if full_name in sent_repos:
+            logger.debug(f"{full_name} allaqachon yuborilgan, o‘tkazib yuborildi.")
+            continue
+        
+        # Repo ma'lumotlarini tayyorlash
+        repo_info = {
+            "full_name": full_name,
+            "name": repo["name"],
+            "owner": repo["owner"]["login"],
+            "stars": repo["stargazers_count"],
+            "description": repo["description"] or "No description",
+            "default_branch": repo.get("default_branch", "main")
+        }
+        
+        logger.info(f"➡️  {full_name} tekshirilmoqda...")
+        
+        # ZIP yuklab olish
+        zip_path = download_repo_zip(full_name, repo_info["default_branch"])
+        if not zip_path:
+            # Agar default branch ishlamasa, boshqa branchlarni sinaymiz
+            zip_path = download_repo_zip(full_name, "main")
+            if not zip_path:
+                zip_path = download_repo_zip(full_name, "master")
+        
+        if zip_path:
+            # Yuborish
+            success = send_to_telegram(zip_path, repo_info)
+            
+            # Tozalash
+            try:
+                os.remove(zip_path)
+            except:
+                pass
+            
+            if success:
+                save_sent_repo(full_name)
+                new_repos_count += 1
+            
+            # Rate limit uchun kutish
+            time.sleep(2)
+    
+    logger.info(f"✅ {new_repos_count} ta yangi repo kanalga yuborildi.")
 
-    name, stars, owner, repo_url = repo
-    zip_url = f"https://github.com/{owner}/{name}/archive/refs/heads/main.zip"
+# ------------------- SCHEDULER -------------------
+def run_scheduler():
+    schedule.every(5).minutes.do(process_popular_repos)
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
-    r = requests.get(zip_url)
-    if len(r.content) > 50*1024*1024:
-        print(f"{name} fayl kattaligi 50MB dan oshadi, o'tkazildi")
-        cursor.close()
-        conn.close()
-        return
+# ------------------- FLASK SERVER -------------------
+app = Flask(__name__)
 
-    with open("repo.zip", "wb") as f:
-        f.write(r.content)
+@app.route('/')
+def health():
+    return "Bot ishlayapti!", 200
 
-    caption = generate_caption(name, stars)
-
-    bot.send_document(
-        chat_id=CHANNEL_ID,
-        document=open("repo.zip", "rb"),
-        caption=caption
-    )
-
-    cursor.execute(
-        "INSERT INTO repos(repo_url) VALUES(%s) ON CONFLICT DO NOTHING",
-        (repo_url,)
-    )
-    conn.commit()
-
-    os.remove("repo.zip")
-    print(f"{name} yuborildi!")
-
-    cursor.close()
-    conn.close()
-
-# =============================
-# Scheduler (har 10 daqiqa)
-# =============================
-scheduler = BackgroundScheduler(timezone=pytz.UTC)
-scheduler.add_job(send_repo, "interval", minutes=5)
-scheduler.start()
-
-# =============================
-# Webhookni avtomatik o‘rnatish
-# =============================
-def set_webhook():
-    if RENDER_URL:
-        webhook_url = f"{RENDER_URL}/{BOT_TOKEN}"
-        url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
-        r = requests.get(url, params={"url": webhook_url})
-        print("Webhook set:", r.json())
-
-set_webhook()
-
-# =============================
-# Flask routes
-# =============================
-@app.route("/", methods=["GET"])
-def home():
-    return "Bot ishlayapti"
-
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def webhook():
-    data = request.get_json()
-    chat_id = data.get("message", {}).get("chat", {}).get("id")
-    if chat_id != CHANNEL_ID:
-        return "Not allowed"
-    return "ok"
-
-# =============================
-# Flask run
-# =============================
+# ------------------- BOSHLASH -------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
-
+    logger.info("🤖 Avtomatik GitHub popular repo bot ishga tushdi.")
+    logger.info(f"Qidiruv so‘rovi: {SEARCH_QUERY}")
+    
+    # Scheduler thread
+    import threading
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+    
+    # Dastlab bir marta ishga tushirish
+    process_popular_repos()
+    
+    # Flask server
+    app.run(host="0.0.0.0", port=PORT)
