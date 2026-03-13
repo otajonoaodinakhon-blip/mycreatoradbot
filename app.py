@@ -35,60 +35,81 @@ def get_db_connection():
 
 def init_db():
     """Jadvallarni yaratish (birinchi marta ishga tushganda)"""
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    # sent_repos jadvali
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS sent_repos (
-            id SERIAL PRIMARY KEY,
-            full_name VARCHAR(255) UNIQUE NOT NULL,
-            name VARCHAR(255),
-            owner VARCHAR(255),
-            stars INT,
-            description TEXT,
-            language VARCHAR(100),
-            size_kb INT,
-            sent_at TIMESTAMP DEFAULT NOW()
-        )
-    """)
-    
-    # bot_state jadvali (pagination uchun)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS bot_state (
-            key VARCHAR(50) PRIMARY KEY,
-            value INT NOT NULL
-        )
-    """)
-    
-    # current_page mavjudligini tekshirish
-    cur.execute("SELECT value FROM bot_state WHERE key = 'current_page'")
-    if cur.fetchone() is None:
-        cur.execute("INSERT INTO bot_state (key, value) VALUES ('current_page', 1)")
-    
-    conn.commit()
-    cur.close()
-    conn.close()
-    logger.info("✅ PostgreSQL jadvallari tayyor")
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        
+        # sent_repos jadvali
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sent_repos (
+                id SERIAL PRIMARY KEY,
+                full_name VARCHAR(255) UNIQUE NOT NULL,
+                name VARCHAR(255),
+                owner VARCHAR(255),
+                stars INT,
+                description TEXT,
+                language VARCHAR(100),
+                size_kb INT,
+                sent_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        logger.info("✅ sent_repos jadvali yaratildi yoki mavjud")
+        
+        # bot_state jadvali
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key VARCHAR(50) PRIMARY KEY,
+                value INT NOT NULL
+            )
+        """)
+        logger.info("✅ bot_state jadvali yaratildi yoki mavjud")
+        
+        # current_page mavjudligini tekshirish
+        cur.execute("SELECT value FROM bot_state WHERE key = 'current_page'")
+        if cur.fetchone() is None:
+            cur.execute("INSERT INTO bot_state (key, value) VALUES ('current_page', 1)")
+            logger.info("✅ current_page qiymati qo'shildi")
+        else:
+            logger.info("✅ current_page mavjud")
+        
+        conn.commit()
+        logger.info("✅ PostgreSQL jadvallari tayyor")
+    except Exception as e:
+        logger.error(f"❌ init_db xatosi: {e}")
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
 
 def get_current_page():
     """Qaysi sahifada qolganini olish"""
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("SELECT value FROM bot_state WHERE key = 'current_page'")
-    page = cur.fetchone()[0]
+    result = cur.fetchone()
     cur.close()
     conn.close()
-    return page
+    if result:
+        return result[0]
+    else:
+        # Agar qandaydir sabab bilan yo'q bo'lsa, 1 qaytar va bazaga yoz
+        logger.warning("current_page topilmadi, 1 ga o'rnatilmoqda")
+        update_current_page(1)
+        return 1
 
 def update_current_page(page):
     """Yangi sahifani saqlash"""
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE bot_state SET value = %s WHERE key = 'current_page'", (page,))
+    cur.execute("""
+        INSERT INTO bot_state (key, value) VALUES ('current_page', %s)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+    """, (page,))
     conn.commit()
     cur.close()
     conn.close()
+    logger.debug(f"current_page yangilandi: {page}")
 
 def is_repo_sent(full_name):
     """Repo avval yuborilganmi?"""
@@ -125,11 +146,13 @@ def save_large_repo(full_name, size_kb):
     """Katta reponi ham eslab qolish (qayta tekshirmaslik uchun)"""
     conn = get_db_connection()
     cur = conn.cursor()
+    # name ni olish uchun full_name dan foydalanamiz (repo nomi)
+    repo_name = full_name.split('/')[-1]
     cur.execute("""
         INSERT INTO sent_repos (full_name, name, size_kb)
         VALUES (%s, %s, %s)
         ON CONFLICT (full_name) DO NOTHING
-    """, (full_name, full_name.split('/')[-1], size_kb))
+    """, (full_name, repo_name, size_kb))
     conn.commit()
     cur.close()
     conn.close()
@@ -181,7 +204,7 @@ def check_repo_size(repo_full_name):
             logger.error(f"Repo info xatosi {repo_full_name}: {resp.status_code}")
             return None
     except Exception as e:
-        logger.error(f"Repo info so‘rovida xato {repo_full_name}: {e}")
+        logger.error(f"Repo info so'rovida xato {repo_full_name}: {e}")
         return None
 
 # ------------------- ZIP YUKLAB OLISH -------------------
@@ -190,6 +213,7 @@ def download_repo_zip(repo_full_name):
     for branch in BRANCHES:
         zip_url = f"https://github.com/{repo_full_name}/archive/refs/heads/{branch}.zip"
         try:
+            # HEAD so'rov orqali hajmni tekshirish
             head_resp = requests.head(zip_url, allow_redirects=True, timeout=10)
             if head_resp.status_code == 200:
                 content_length = head_resp.headers.get('Content-Length')
@@ -197,6 +221,7 @@ def download_repo_zip(repo_full_name):
                     logger.info(f"{repo_full_name} ({branch}) hajmi {content_length} bayt – 50MB dan katta (HEAD), tashlab ketildi.")
                     return "TOO_LARGE"
                 
+                # Yuklab olish
                 zip_resp = requests.get(zip_url, stream=True, timeout=30)
                 if zip_resp.status_code == 200:
                     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
@@ -256,75 +281,76 @@ def send_to_telegram(file_path, repo_info):
 # ------------------- ASOSIY JOB (PAGINATION) -------------------
 def process_next_repo():
     """Bitta yangi reponi topib, yuklab, yuboradi"""
-    current_page = get_current_page()
-    logger.info(f"🔍 Sahifa {current_page} tekshirilmoqda...")
-    
-    repos = search_repos_page(current_page)
-    if not repos:
-        logger.warning("Bu sahifada repo topilmadi, 1-sahifaga qaytish")
-        update_current_page(1)
-        return
-    
-    sent_count = 0
-    for repo in repos:
-        full_name = repo["full_name"]
+    try:
+        current_page = get_current_page()
+        logger.info(f"🔍 Sahifa {current_page} tekshirilmoqda...")
         
-        # Oldin yuborilganmi?
-        if is_repo_sent(full_name):
-            logger.debug(f"{full_name} allaqachon yuborilgan, o‘tkazib yuborildi.")
-            continue
+        repos = search_repos_page(current_page)
+        if not repos:
+            logger.warning("Bu sahifada repo topilmadi, 1-sahifaga qaytish")
+            update_current_page(1)
+            return
         
-        # Repo hajmini tekshirish
-        size_kb = check_repo_size(full_name)
-        if size_kb is None:
-            continue
-        
-        if size_kb > MAX_SIZE_KB:
-            logger.info(f"{full_name} hajmi {size_kb/1024:.1f} MB – 50 MB dan katta, tashlab ketildi.")
-            save_large_repo(full_name, size_kb)
-            continue
-        
-        # Repo ma'lumotlari
-        repo_info = {
-            "full_name": full_name,
-            "name": repo["name"],
-            "owner": repo["owner"]["login"],
-            "stars": repo["stargazers_count"],
-            "description": repo["description"] or "No description",
-            "language": repo.get("language")
-        }
-        
-        # ZIP yuklab olish
-        result = download_repo_zip(full_name)
-        if result == "TOO_LARGE":
-            save_large_repo(full_name, size_kb)
-            continue
-        elif result is None:
-            logger.warning(f"{full_name} yuklab olinmadi")
-            continue
-        else:
-            zip_path = result
-            success = send_to_telegram(zip_path, repo_info)
-            try:
-                os.remove(zip_path)
-            except:
-                pass
+        for repo in repos:
+            full_name = repo["full_name"]
             
-            if success:
-                save_repo(repo_info, size_kb)
-                sent_count += 1
-                logger.info(f"✅ Yuborildi: {full_name}")
+            # Oldin yuborilganmi?
+            if is_repo_sent(full_name):
+                logger.debug(f"{full_name} allaqachon yuborilgan, o'tkazib yuborildi.")
+                continue
+            
+            # Repo hajmini tekshirish
+            size_kb = check_repo_size(full_name)
+            if size_kb is None:
+                continue
+            
+            if size_kb > MAX_SIZE_KB:
+                logger.info(f"{full_name} hajmi {size_kb/1024:.1f} MB – 50 MB dan katta, tashlab ketildi.")
+                save_large_repo(full_name, size_kb)
+                continue
+            
+            # Repo ma'lumotlari
+            repo_info = {
+                "full_name": full_name,
+                "name": repo["name"],
+                "owner": repo["owner"]["login"],
+                "stars": repo["stargazers_count"],
+                "description": repo["description"] or "No description",
+                "language": repo.get("language")
+            }
+            
+            # ZIP yuklab olish
+            result = download_repo_zip(full_name)
+            if result == "TOO_LARGE":
+                save_large_repo(full_name, size_kb)
+                continue
+            elif result is None:
+                logger.warning(f"{full_name} yuklab olinmadi")
+                continue
+            else:
+                zip_path = result
+                success = send_to_telegram(zip_path, repo_info)
+                try:
+                    os.remove(zip_path)
+                except Exception as e:
+                    logger.error(f"Faylni o'chirishda xato: {e}")
                 
-                # Bitta repo yubordik, keyingi sahifaga o'tamiz
-                next_page = current_page + 1
-                update_current_page(next_page)
-                logger.info(f"➡️ Keyingi sahifa: {next_page}")
-                return  # Bitta repo yubordik, to'xtaymiz
-    
-    # Agar bu sahifada yuborilmagan repolar bo'lmasa, keyingi sahifaga o'tish
-    if sent_count == 0:
+                if success:
+                    save_repo(repo_info, size_kb)
+                    logger.info(f"✅ Yuborildi: {full_name}")
+                    
+                    # Bitta repo yubordik, keyingi sahifaga o'tamiz
+                    next_page = current_page + 1
+                    update_current_page(next_page)
+                    logger.info(f"➡️ Keyingi sahifa: {next_page}")
+                    return  # Bitta repo yubordik, to'xtaymiz
+        
+        # Agar bu sahifada yuborilmagan repolar bo'lmasa, keyingi sahifaga o'tish
         logger.info(f"Sahifa {current_page} da yangi repolar yo'q, keyingi sahifaga o'tish")
         update_current_page(current_page + 1)
+    
+    except Exception as e:
+        logger.error(f"process_next_repo xatosi: {e}")
 
 # ------------------- SCHEDULER -------------------
 def run_scheduler():
