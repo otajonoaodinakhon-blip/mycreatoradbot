@@ -142,7 +142,7 @@ def send_repo():
 # Scheduler (har 10 daqiqa)
 # =============================
 scheduler = BackgroundScheduler(timezone=pytz.UTC)
-scheduler.add_job(send_repo, "interval", minutes=10)
+scheduler.add_job(send_repo, "interval", minutes=5)
 scheduler.start()
 
 # =============================
@@ -177,3 +177,4 @@ def webhook():
 # =============================
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
