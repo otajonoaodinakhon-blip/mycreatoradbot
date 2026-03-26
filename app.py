@@ -22,22 +22,19 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 PORT = int(os.environ.get("PORT", 5000))
 
 # ============ RATE LIMIT SOZLAMALARI ============
-# GitHub limit: 5000 so'rov/soat (token bilan)
-# Har bir repo tekshirish uchun 2 ta so'rov ketadi (search + size)
-# Xavfsizlik uchun 1 sekund/so'rov
-GITHUB_REQUEST_DELAY = 1.0  # 1 sekund
-
-# Telegram limit: 30 xabar/sekund (nazariy), lekin fayl yuklash sekinroq
-# Xavfsizlik uchun 1 xabar/sekund (kanalga yuborayotganda)
+GITHUB_REQUEST_DELAY = 0.5
 TELEGRAM_MESSAGE_DELAY = 1.0
 
 # ============ BOT SOZLAMALARI ============
-REPOS_PER_RUN = int(os.environ.get("REPOS_PER_RUN", 10))  # Har bir ishga tushganda yuboriladigan repo soni
-SEARCH_QUERY = "stars:>10"  # 10+ yulduzli repolar
-PER_PAGE = 100  # GitHub API maksimal 100
-MAX_SIZE_MB = 45  # 45 MB (xavfsizlik chegarasi, Telegram 50 MB)
+REPOS_PER_RUN = int(os.environ.get("REPOS_PER_RUN", 10))
+SEARCH_QUERY = "stars:>100"  # 100+ yulduz (kamroq, lekin sifatli)
+PER_PAGE = 100
+MAX_SIZE_MB = 45
 MAX_SIZE_BYTES = MAX_SIZE_MB * 1024 * 1024
 BRANCHES = ["main", "master"]
+
+# GitHub API maksimal 1000 natija qaytaradi
+MAX_GITHUB_PAGE = 10  # 1000 / 100 = 10 sahifa
 
 # ============ LOGGING ============
 logging.basicConfig(
@@ -46,37 +43,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== RATE LIMITER KLASSLARI ====================
+# ==================== RATE LIMITER ====================
 
 class RateLimiter:
-    """Umumiy rate limit boshqaruvchisi"""
     def __init__(self, delay=1.0):
         self.delay = delay
         self.last_request = None
     
     def wait(self):
-        """So'rovdan oldin kerakli vaqtni kutish"""
         if self.last_request:
             elapsed = time.time() - self.last_request
             if elapsed < self.delay:
                 time.sleep(self.delay - elapsed)
         self.last_request = time.time()
 
-# Rate limiter obyektlari
 github_limiter = RateLimiter(delay=GITHUB_REQUEST_DELAY)
 telegram_limiter = RateLimiter(delay=TELEGRAM_MESSAGE_DELAY)
 
 # ==================== POSTGRESQL FUNKSIYALARI ====================
 
 def get_db_connection():
-    """PostgreSQL ga ulanish"""
     if not DATABASE_URL:
-        logger.error("❌ DATABASE_URL environment variable topilmadi!")
+        logger.error("❌ DATABASE_URL topilmadi!")
         return None
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
-    """Jadvallarni yaratish"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -84,7 +76,6 @@ def init_db():
         
         cur = conn.cursor()
         
-        # sent_repos jadvali
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sent_repos (
                 id SERIAL PRIMARY KEY,
@@ -98,9 +89,7 @@ def init_db():
                 sent_at TIMESTAMP DEFAULT NOW()
             )
         """)
-        logger.info("✅ sent_repos jadvali tayyor")
         
-        # bot_state jadvali (sahifa)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS bot_state (
                 key VARCHAR(50) PRIMARY KEY,
@@ -108,13 +97,10 @@ def init_db():
             )
         """)
         
-        # current_page
         cur.execute("SELECT value FROM bot_state WHERE key = 'current_page'")
         if cur.fetchone() is None:
             cur.execute("INSERT INTO bot_state (key, value) VALUES ('current_page', 1)")
-            logger.info("✅ current_page = 1 qo'shildi")
         
-        # current_index (sahifa ichidagi index)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS bot_state_index (
                 key VARCHAR(50) PRIMARY KEY,
@@ -124,7 +110,6 @@ def init_db():
         cur.execute("SELECT value FROM bot_state_index WHERE key = 'current_index'")
         if cur.fetchone() is None:
             cur.execute("INSERT INTO bot_state_index (key, value) VALUES ('current_index', 0)")
-            logger.info("✅ current_index = 0 qo'shildi")
         
         conn.commit()
         logger.info("✅ PostgreSQL jadvallari tayyor")
@@ -132,13 +117,12 @@ def init_db():
     except Exception as e:
         logger.error(f"❌ init_db xatosi: {e}")
     finally:
-        if cur:
+        if 'cur' in locals():
             cur.close()
-        if conn:
+        if 'conn' in locals():
             conn.close()
 
 def get_current_page():
-    """Qaysi sahifada qolganini olish"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -148,13 +132,24 @@ def get_current_page():
         result = cur.fetchone()
         cur.close()
         conn.close()
-        return result[0] if result else 1
+        page = result[0] if result else 1
+        
+        # Sahifa 10 dan oshmasligi kerak (GitHub limit)
+        if page > MAX_GITHUB_PAGE:
+            logger.info(f"📌 Sahifa {page} GitHub limitidan oshdi, 1-sahifaga qaytish")
+            update_current_page(1)
+            return 1
+        return page
     except Exception as e:
         logger.error(f"get_current_page xatosi: {e}")
         return 1
 
 def update_current_page(page):
-    """Yangi sahifani saqlash"""
+    # Sahifani 1-10 oralig'ida saqlash
+    if page > MAX_GITHUB_PAGE:
+        page = 1
+        logger.info(f"🔄 Sahifa limitdan oshdi, 1 ga qaytarildi")
+    
     try:
         conn = get_db_connection()
         if not conn:
@@ -172,7 +167,6 @@ def update_current_page(page):
         logger.error(f"update_current_page xatosi: {e}")
 
 def get_current_index():
-    """Sahifa ichidagi qaysi repodan davom etish"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -188,7 +182,6 @@ def get_current_index():
         return 0
 
 def update_current_index(index):
-    """Sahifa ichidagi indexni yangilash"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -201,12 +194,10 @@ def update_current_index(index):
         conn.commit()
         cur.close()
         conn.close()
-        logger.debug(f"current_index yangilandi: {index}")
     except Exception as e:
         logger.error(f"update_current_index xatosi: {e}")
 
 def is_repo_sent(full_name):
-    """Repo avval yuborilganmi?"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -222,7 +213,6 @@ def is_repo_sent(full_name):
         return False
 
 def save_repo(repo_info, size_mb):
-    """Yuborilgan reponi bazaga qo'shish"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -248,7 +238,6 @@ def save_repo(repo_info, size_mb):
         logger.error(f"save_repo xatosi: {e}")
 
 def save_large_repo(full_name, size_mb):
-    """Katta reponi eslab qolish"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -267,7 +256,6 @@ def save_large_repo(full_name, size_mb):
         logger.error(f"save_large_repo xatosi: {e}")
 
 def get_total_sent():
-    """Jami yuborilgan repo soni"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -282,10 +270,9 @@ def get_total_sent():
         logger.error(f"get_total_sent xatosi: {e}")
         return 0
 
-# ==================== GITHUB API FUNKSIYALARI ====================
+# ==================== GITHUB API ====================
 
 def github_request(url, params=None):
-    """GitHub API ga rate limit bilan so'rov yuborish"""
     github_limiter.wait()
     
     headers = {"Accept": "application/vnd.github.v3+json"}
@@ -295,16 +282,15 @@ def github_request(url, params=None):
     try:
         resp = requests.get(url, params=params, headers=headers, timeout=15)
         
-        # Rate limitni tekshirish
         if resp.status_code == 403:
             remaining = resp.headers.get('X-RateLimit-Remaining')
             if remaining == '0':
                 reset_time = int(resp.headers.get('X-RateLimit-Reset', 0))
                 wait_time = reset_time - time.time()
                 if wait_time > 0:
-                    logger.warning(f"⚠️ GitHub rate limit! {wait_time:.0f} sekund kutish kerak")
+                    logger.warning(f"⚠️ GitHub rate limit! {wait_time:.0f} sekund kutish")
                     time.sleep(wait_time + 5)
-                    return github_request(url, params)  # Qayta urinish
+                    return github_request(url, params)
         
         return resp
     except Exception as e:
@@ -312,7 +298,15 @@ def github_request(url, params=None):
         return None
 
 def search_repos_page(page):
-    """GitHub Search API orqali ma'lum sahifadagi repolarni qidiradi"""
+    """GitHub Search API - faqat 1-10 sahifalar ishlaydi"""
+    
+    # GitHub limiti: maksimal 10-sahifa (1000 natija)
+    if page > MAX_GITHUB_PAGE:
+        logger.info(f"🏁 Sahifa {page} GitHub limitidan oshdi ({MAX_GITHUB_PAGE} maksimal). 1-sahifaga qaytish...")
+        update_current_page(1)
+        update_current_index(0)
+        return []
+    
     url = "https://api.github.com/search/repositories"
     params = {
         "q": SEARCH_QUERY,
@@ -326,36 +320,42 @@ def search_repos_page(page):
     if resp and resp.status_code == 200:
         data = resp.json()
         items = data.get("items", [])
-        logger.info(f"GitHub dan {len(items)} ta repo topildi (page {page})")
+        total_count = data.get("total_count", 0)
+        logger.info(f"✅ GitHub dan {len(items)} ta repo topildi (page {page}/{MAX_GITHUB_PAGE}, total: {total_count})")
+        
+        # Agar repo bo'lmasa, 1-sahifaga qaytish
+        if not items and page > 1:
+            logger.info(f"📌 Sahifa {page} bo'sh, 1-sahifaga qaytish")
+            update_current_page(1)
+            update_current_index(0)
+            return []
+        
         return items
     elif resp:
-        logger.error(f"GitHub search xatosi: {resp.status_code}")
+        logger.error(f"❌ GitHub search xatosi: {resp.status_code}")
+        if resp.status_code == 422:
+            logger.info("📌 422 xatosi - GitHub limitiga yetildi, 1-sahifaga qaytish")
+            update_current_page(1)
+            update_current_index(0)
     return []
 
 def get_repo_size(repo_full_name):
-    """Reponing hajmini MB da qaytaradi"""
     url = f"https://api.github.com/repos/{repo_full_name}"
     resp = github_request(url)
     
     if resp and resp.status_code == 200:
         data = resp.json()
         size_kb = data.get("size", 0)
-        size_mb = size_kb / 1024
-        logger.debug(f"{repo_full_name} hajmi: {size_mb:.1f} MB")
-        return size_mb
-    else:
-        logger.error(f"Repo info xatosi {repo_full_name}: {resp.status_code if resp else 'No response'}")
-        return None
+        return size_kb / 1024
+    return None
 
-# ==================== REPO YUKLASH FUNKSIYALARI ====================
+# ==================== REPO YUKLASH ====================
 
 def download_repo_zip(repo_full_name):
-    """Reponi ZIP sifatida yuklab oladi"""
     for branch in BRANCHES:
         zip_url = f"https://github.com/{repo_full_name}/archive/refs/heads/{branch}.zip"
         
         try:
-            # HEAD so'rov orqali hajmni tekshirish
             head_resp = requests.head(zip_url, allow_redirects=True, timeout=10)
             
             if head_resp.status_code == 200:
@@ -366,10 +366,9 @@ def download_repo_zip(repo_full_name):
                     size_mb = size_bytes / (1024 * 1024)
                     
                     if size_bytes > MAX_SIZE_BYTES:
-                        logger.info(f"⚠️ {repo_full_name} hajmi {size_mb:.1f} MB – {MAX_SIZE_MB} MB dan katta")
+                        logger.info(f"⚠️ {repo_full_name} hajmi {size_mb:.1f} MB – 45MB dan katta")
                         return "TOO_LARGE", size_mb
                 
-                # Yuklab olish
                 zip_resp = requests.get(zip_url, stream=True, timeout=60)
                 
                 if zip_resp.status_code == 200:
@@ -385,25 +384,18 @@ def download_repo_zip(repo_full_name):
                         temp_file.write(chunk)
                     
                     temp_file.close()
-                    logger.info(f"✅ Yuklab olindi: {repo_full_name} ({branch})")
+                    logger.info(f"✅ Yuklab olindi: {repo_full_name}")
                     return temp_file.name, downloaded / (1024 * 1024)
                     
-            else:
-                logger.debug(f"Branch {branch} topilmadi (status {head_resp.status_code})")
-                
         except Exception as e:
-            logger.debug(f"Branch {branch} tekshirishda xato: {e}")
+            logger.debug(f"Branch {branch} xatosi: {e}")
             continue
     
-    logger.error(f"❌ Hech qanday branch ishlamadi: {repo_full_name}")
     return None, 0
 
-# ==================== TELEGRAM YUBORISH FUNKSIYALARI ====================
+# ==================== TELEGRAM ====================
 
 def send_to_telegram(file_path, repo_info, size_mb):
-    """ZIP faylni Telegram kanaliga rate limit bilan yuboradi"""
-    
-    # Rate limitni kutish
     telegram_limiter.wait()
     
     caption = f"""
@@ -437,9 +429,8 @@ def send_to_telegram(file_path, repo_info, size_mb):
             logger.info(f"✅ Yuborildi: {repo_info['full_name']}")
             return True
         elif resp.status_code == 429:
-            error_data = resp.json()
-            retry_after = error_data.get('parameters', {}).get('retry_after', 30)
-            logger.warning(f"⚠️ Telegram rate limit! {retry_after} sekund kutish kerak")
+            retry_after = resp.json().get('parameters', {}).get('retry_after', 30)
+            logger.warning(f"⚠️ Telegram rate limit! {retry_after} sekund kutish")
             time.sleep(retry_after)
             return False
         else:
@@ -447,7 +438,7 @@ def send_to_telegram(file_path, repo_info, size_mb):
             return False
             
     except Exception as e:
-        logger.error(f"❌ Telegramga yuborishda xato: {e}")
+        logger.error(f"❌ Telegram xatosi: {e}")
         return False
 
 # ==================== ASOSIY JOB ====================
@@ -455,45 +446,43 @@ def send_to_telegram(file_path, repo_info, size_mb):
 def process_repos_batch():
     """Har bir ishga tushganda REPOS_PER_RUN ta repo yuboradi"""
     sent_count = 0
-    skipped_count = 0
-    large_count = 0
+    checked_pages = 0
+    MAX_PAGES_TO_CHECK = 5  # Har bir ishga tushganda ko'pi bilan 5 sahifa tekshir
     
     logger.info(f"🚀 Boshlanyapti! {REPOS_PER_RUN} ta repo yuboriladi")
     
-    while sent_count < REPOS_PER_RUN:
+    while sent_count < REPOS_PER_RUN and checked_pages < MAX_PAGES_TO_CHECK:
         current_page = get_current_page()
         current_index = get_current_index()
         
-        logger.info(f"🔍 Sahifa {current_page}, index {current_index} tekshirilmoqda...")
+        logger.info(f"🔍 Sahifa {current_page}/{MAX_GITHUB_PAGE}, index {current_index}")
         
-        # Sahifadagi repolarni olish
         repos = search_repos_page(current_page)
         if not repos:
-            logger.info(f"Sahifa {current_page} bo'sh, keyingi sahifaga o'tish")
-            update_current_page(current_page + 1)
+            # Agar repo bo'lmasa, keyingi sahifaga o'tish
+            next_page = current_page + 1
+            if next_page > MAX_GITHUB_PAGE:
+                next_page = 1
+                logger.info(f"🔄 Barcha sahifalar tekshirildi, 1-sahifaga qaytish")
+            update_current_page(next_page)
             update_current_index(0)
+            checked_pages += 1
             continue
         
-        # Qolgan repolarni tekshirish
+        # Sahifadagi repolarni tekshirish
         for i in range(current_index, len(repos)):
             repo = repos[i]
             full_name = repo["full_name"]
             
-            # Oldin yuborilganmi?
             if is_repo_sent(full_name):
                 logger.debug(f"{full_name} oldin yuborilgan")
-                skipped_count += 1
                 continue
             
-            # Repo hajmini tekshirish
             size_mb = get_repo_size(full_name)
-            if size_mb is None:
-                continue
-            
-            if size_mb > MAX_SIZE_MB:
-                logger.info(f"⚠️ {full_name} hajmi {size_mb:.1f} MB – {MAX_SIZE_MB} MB dan katta")
-                save_large_repo(full_name, size_mb)
-                large_count += 1
+            if size_mb is None or size_mb > MAX_SIZE_MB:
+                if size_mb:
+                    logger.info(f"⚠️ {full_name} hajmi {size_mb:.1f} MB – tashlab ketildi")
+                    save_large_repo(full_name, size_mb)
                 continue
             
             repo_info = {
@@ -510,16 +499,13 @@ def process_repos_batch():
             
             if result == "TOO_LARGE":
                 save_large_repo(full_name, actual_size)
-                large_count += 1
                 continue
             elif result is None:
-                logger.warning(f"{full_name} yuklab olinmadi")
                 continue
             
             # Telegramga yuborish
             success = send_to_telegram(result, repo_info, actual_size)
             
-            # Faylni o'chirish
             try:
                 os.remove(result)
             except:
@@ -529,115 +515,97 @@ def process_repos_batch():
                 save_repo(repo_info, actual_size)
                 sent_count += 1
                 logger.info(f"✅ {sent_count}/{REPOS_PER_RUN} yuborildi: {full_name}")
-                
-                # Indexni yangilash
                 update_current_index(i + 1)
                 
                 if sent_count >= REPOS_PER_RUN:
                     break
-            else:
-                # Yuborilmadi, keyingi safar qayta urinish
-                update_current_index(i)
-                logger.warning(f"⚠️ {full_name} yuborilmadi, keyingi safar qayta uriniladi")
-                return
         
-        # Agar sahifa tugagan bo'lsa, keyingi sahifaga o'tish
+        # Agar bu sahifada yuborilgan bo'lsa va hali to'liq yuborilmagan bo'lsa
         if sent_count < REPOS_PER_RUN:
-            logger.info(f"Sahifa {current_page} tugadi, keyingi sahifaga o'tish")
-            update_current_page(current_page + 1)
+            next_page = current_page + 1
+            if next_page > MAX_GITHUB_PAGE:
+                next_page = 1
+                logger.info(f"🔄 Barcha sahifalar tekshirildi, 1-sahifaga qaytish")
+            update_current_page(next_page)
             update_current_index(0)
+            checked_pages += 1
+            logger.info(f"➡️ Keyingi sahifa: {next_page}")
     
-    logger.info(f"✅ Yakunlandi! Yuborilgan: {sent_count}, O'tkazib yuborilgan: {skipped_count}, Katta repolar: {large_count}")
+    logger.info(f"✅ Yakunlandi! Yuborilgan: {sent_count}, Tekshirilgan sahifalar: {checked_pages}")
 
 # ==================== SCHEDULER ====================
 
 def run_scheduler():
-    """Scheduler thread"""
     schedule.every(5).minutes.do(process_repos_batch)
-    logger.info("⏰ Scheduler ishga tushdi: har 5 minutda ishlaydi")
+    logger.info("⏰ Scheduler ishga tushdi: har 5 minutda")
     
     while True:
         schedule.run_pending()
         time.sleep(1)
 
-# ==================== FLASK SERVER ====================
+# ==================== FLASK ====================
 
 app = Flask(__name__)
 
 @app.route('/')
 def health():
-    """Health check endpoint"""
     return jsonify({
         "status": "running",
-        "version": "2.0.0",
-        "timestamp": datetime.now().isoformat()
-    }), 200
+        "total_sent": get_total_sent(),
+        "current_page": get_current_page(),
+        "max_page": MAX_GITHUB_PAGE
+    })
 
 @app.route('/stats')
 def stats():
-    """Statistika endpoint"""
     return jsonify({
         "total_sent": get_total_sent(),
         "current_page": get_current_page(),
         "current_index": get_current_index(),
+        "max_page": MAX_GITHUB_PAGE,
         "repos_per_run": REPOS_PER_RUN,
-        "config": {
-            "max_size_mb": MAX_SIZE_MB,
-            "search_query": SEARCH_QUERY,
-            "github_request_delay": GITHUB_REQUEST_DELAY,
-            "telegram_delay": TELEGRAM_MESSAGE_DELAY
-        }
-    }), 200
+        "search_query": SEARCH_QUERY
+    })
 
 @app.route('/trigger', methods=['POST'])
 def trigger():
-    """Manual trigger endpoint"""
-    try:
-        process_repos_batch()
-        return jsonify({"status": "success", "message": "Bot ishga tushirildi"}), 200
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+    threading.Thread(target=process_repos_batch).start()
+    return jsonify({"status": "started"})
 
-# ==================== ASOSIY ISHGA TUSHIRISH ====================
+@app.route('/reset', methods=['POST'])
+def reset():
+    """Sahifani 1 ga qaytarish"""
+    update_current_page(1)
+    update_current_index(0)
+    return jsonify({"status": "reset", "current_page": 1})
+
+# ==================== ASOSIY ====================
 
 if __name__ == "__main__":
     logger.info("="*50)
-    logger.info("🤖 GitHub Repo Monitor Bot v2.0")
+    logger.info("🤖 GitHub Repo Monitor Bot v2.2")
     logger.info("="*50)
     logger.info(f"⚡ Har bir ishga tushganda: {REPOS_PER_RUN} ta repo")
-    logger.info(f"⏱️  Har 5 minutda ishlaydi")
-    logger.info(f"📦 Maksimal fayl hajmi: {MAX_SIZE_MB} MB")
-    logger.info(f"🐙 GitHub rate limit: 5000 so'rov/soat (token bilan)")
-    logger.info(f"📱 Telegram rate limit: 1 xabar/sekund")
+    logger.info(f"🔍 Qidiruv: {SEARCH_QUERY}")
+    logger.info(f"📄 GitHub maksimal sahifa: {MAX_GITHUB_PAGE} (1000 ta natija)")
+    logger.info(f"📦 Maksimal hajm: {MAX_SIZE_MB} MB")
     logger.info("="*50)
     
-    # Environment variables tekshirish
-    if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN topilmadi!")
-        exit(1)
-    if not CHANNEL_ID:
-        logger.error("❌ CHANNEL_ID topilmadi!")
-        exit(1)
-    if not DATABASE_URL:
-        logger.error("❌ DATABASE_URL topilmadi!")
+    if not BOT_TOKEN or not CHANNEL_ID or not DATABASE_URL:
+        logger.error("❌ BOT_TOKEN, CHANNEL_ID yoki DATABASE_URL topilmadi!")
         exit(1)
     
     if GITHUB_TOKEN:
-        logger.info("✅ GitHub token topildi (5000 so'rov/soat)")
+        logger.info("✅ GitHub token topildi")
     else:
         logger.warning("⚠️ GitHub token topilmadi! Limit: 60 so'rov/soat")
     
-    # Bazani tayyorlash
     init_db()
     
     # Scheduler thread
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     
-    # Dastlab bir marta ishga tushirish
-    logger.info("🚀 Dastlabki ishga tushirish...")
-    process_repos_batch()
-    
     # Flask server
-    logger.info(f"🌐 Flask server ishga tushmoqda: http://0.0.0.0:{PORT}")
+    logger.info(f"🌐 Flask server: http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT)
